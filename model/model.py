@@ -92,57 +92,85 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
-        x = torch.rsqrt(x.pow(2).mean(-1, keepdim=True).add(self.eps))
-        return x
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
     
     def forward(self, x):
-        return self.weight * self._norm(x.float()).tpye_as(x) * x
-    
+        return self.weight * self._norm(x.float()).type_as(x)
 
-def precompute_freqs_cis(dim:int, end:int(32*1024), rope_base, rope_scaling:Optional[dict] = None):
-    # 初始化RoPE频率
-    freqs,attn_factor = (1.0/(rope_base**(torch.arange(0, dim, 2).float()/dim)), 1.0)
+    
+def precompute_freqs(
+    dim: int,
+    end: int = int(32 * 1024),
+    rope_base: float = 1e6,
+    rope_scaling: Optional[dict] = None,
+):
+    # 1. 初始化标准 RoPE 频率。
+    # torch.arange(0, dim, 2) 生成 [0, 2, 4, ... dim-2]
+    # 计算出的 freqs 就是标准的 1 / (base ** (2i / d))
+    freqs, attn_factor = (
+        1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)),
+        1.0,
+    )
 
     if rope_scaling is not None:
-        orig_max,factor,beta_fast,beta_slow = (
-            rope_scaling["original_max_position_embeddings"],
-            rope_scaling["factor"],
-            rope_scaling["beta_fast"],
-            rope_scaling["beta_slow"]
+        # 2. 从配置字典中提取 YaRN 的超参数
+        # orig_max: 模型预训练时的原始最大长度（例如 Llama-2 是 2048 或 4096）
+        # factor: 要扩展的倍数 s (比如从 2k 扩展到 32k，factor 就是 16)
+        # beta_fast (对应论文中的 α): 高频边界，波长比例大于此值的维度不缩放
+        # beta_slow (对应论文中的 β): 低频边界，波长比例小于此值的维度全量缩放
+        # attn_factor: 注意力温度补偿，由于距离拉长导致注意力分布发散（变平缓），需要乘上一个系数让注意力重新“聚焦”
+        orig_max, factor, beta_fast, beta_slow, attn_factor = (
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 16),
+            rope_scaling.get("beta_fast", 32.0),
+            rope_scaling.get("beta_slow", 1.0),
+            rope_scaling.get("attention_factor", 1.0),
         )
 
-        # 推断的长度大于训练长度，使用缩放
-        if end > orig_max:
-            # 波长b到i的映射
-            inv_dim = lambda b:(dim * math.log(orig_max / (b * 2 * math.pi)))/(2 * math.log(rope_base))
-            # 划分高低维度
-            #low： 不需要缩放的维度，high：需要缩放的维度
-            low, high = (max(math.floor(inv_dim(beta_fast))), min(math.ceil(inv_dim(beta_slow)), dim // 2-1))
+        # 只有当要推断的长度大于原始训练长度时，才应用缩放
+        if end / orig_max > 1.0:
+            # 3. 使用前文推导的公式，定义波长比例 b 到维度索引 i 的映射函数
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (
+                2 * math.log(rope_base)
+            )
 
-            # 计算缩放因子
-            # low之前， ramp为0，在high之后，ramp为1，在low和high之间，先行过度
+            # 4. 计算高频区和低频区的维度切分点
+            # low: 不需要缩放的高频部分的最高索引
+            # high: 需要完全缩放的低频部分的最低索引
+            low, high = (
+                max(math.floor(inv_dim(beta_fast)), 0),
+                min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1),
+            )
+
+            # 5. 计算混合因子 γ (Ramp)
+            # 在 low 之前，ramp 为 0；在 high 之后，ramp 为 1；在 low 和 high 之间，线性过渡。
+            # clamp 函数限制了数值只能在 [0, 1] 之间。
             ramp = torch.clamp(
-                (torch.arange(dim // 2, device = freqs.device).float() - low) / max(high - low, 0.001),
-
+                (torch.arange(dim // 2, device=freqs.device).float() - low)
+                / max(high - low, 0.001),
                 0,
                 1,
             )
 
-            reqs = freqs * (1 - ramp + ramp / factor)
-        # 根据end，生成位置索引t
-        t = torch.arange(end, device = freqs.device).float()
+            # 6. 频率融合公式：f'(i) = f(i) * ((1-γ) + γ/s)
+            # 当 ramp=0 时（高频）：系数为 1，保持原频率不变。
+            # 当 ramp=1 时（低频）：系数为 1/factor，即对频率进行线性插值缩放。
+            # ramp在0-1之间时：平滑过渡。
+            freqs = freqs * (1 - ramp + ramp / factor)
 
-        # 计算外积，将t和频率部分相乘，得到每个位置的旋转角度
-        freqs = torch.outer(t, freqs).float()
+    # 7. 根据目标长度 end，生成位置索引向量 t
+    t = torch.arange(end, device=freqs.device)
 
-        freqs_cos = (
-            torch.cat([torch.cos(freqs), torch.cos(freqs)], dim = -1) * attn_factor
-        )
-        freqs_sin = (
-            torch.cat([torch.sin(freqs), torch.sin(freqs)], dim = -1) * attn_factor
-        )
+    # 8. 计算外积：将位置 t 与处理好的频率 freqs 相乘，得到每个位置的旋转角度 θ
+    freqs = torch.outer(t, freqs).float()
 
-        return freqs_cos, freqs_sin
+    # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+
+    return freqs_cos, freqs_sin
+
+
             
 #  编写RoPE
 def apply_rotarry_pos_emb(q, k, cos, sin, position_ids = None, unsqueeze_dim = 1):
@@ -172,13 +200,12 @@ class Attention(nn.Module):
     def __init__(self, args:MokioMindConfig):
         super().__init__()
 
-        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is None else args.num_attention_heads
+        self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
 
         assert args.num_attention_heads % self.num_key_value_heads == 0,
         "num_attention_heads must be divisible by num_key_value_heads"
 
         self.n_local_heads = args.num_attention_heads
-        self.num_key_value_heads = args.num_key_value_heads
         self.n_rep = self.n_local_heads // self.num_key_value_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
 
@@ -197,7 +224,7 @@ class Attention(nn.Module):
         def forward(
             self,
             x:torch.Tensor,
-            position_embedding:Tuple[torch.Tensor, torch.Tensor], 
+            position_embeddings:Tuple[torch.Tensor, torch.Tensor], 
             past_cache:Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
             use_cache = False,
             attention_mask:Optional[torch.Tensor] = None,
@@ -210,7 +237,7 @@ class Attention(nn.Module):
             xk = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
             xv = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
             # qk，使用RoPE
-            cos, sin = position_embedding
+            cos, sin = position_embeddings
             xq, xk = apply_rotarry_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
             # 对于kv，使用repeat（注意kv cache）
             if past_key_value is not None:
@@ -225,7 +252,7 @@ class Attention(nn.Module):
                 repeat_kv(xv, self.n_rep).transpose(1, 2),
             )
             # 进行attention计算，QK^T / sqrt(d)
-            if self.flash and seq_len>1 and (attention_mask is None or torch.all(attention_mask==1)):
+            if self.flash and seq_len>1 and (attention_mask is None or torch.all(attention_mask == 1)):
                 attn_mask=(
                     None
                     if attention_mask is None
@@ -275,6 +302,7 @@ class FeedForward(nn.Module):
 class MokioMindBlock(nn.Module):
     def __init__(self, layer_id:int,config:MokioMindConfig):
         super().__init__()
+        self.config = config
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim = self.hidden_size // self.num_attention_heads
@@ -368,7 +396,7 @@ class MokioMindModel(nn.Module):
             hidden_states, present = layer(
                 hidden_states,
                 position_embedding,
-                past_key_value = past_key_values,
+                past_key_value = past_key_value,
                 use_cache = use_cache,
                 attention_mask = attention_mask,
             )
@@ -397,7 +425,6 @@ class MokioMindForCausalLM(PreTrainedModel,GenerationMixin):
         # 输出层权重和嵌入层的权重共享
         self.model.embed_tokens.weight = self.lm_head.weight
 
-        self.OUT = CausalLMOutputWithPast
 
     def forward(self, input_ids:Optional[torch.Tensor] = None,
                 attention_mask:Optional[torch.Tensor] = None,
@@ -416,9 +443,8 @@ class MokioMindForCausalLM(PreTrainedModel,GenerationMixin):
         slice_indices = (slice(-Logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep)
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        self.OUT.__setitem__("last_hidden_state", hidden_states)
-        self.OUT.__setitem__("logits", logits)
-        self.OUT.__setitem__("past_key_values", past_key_values)
-
-        return self.OUT()
-    
+        return CausalLMOutputWithPast(
+            logits = logits,
+            past_key_values = past_key_values,
+            hidden_states = hidden_states,
+        )
