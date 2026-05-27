@@ -81,7 +81,7 @@ import math
 from typing import Optional, Tuple
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
-from transformers import GenerationMixin
+from transformers import PreTrainedModel,GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class RMSNorm(nn.Module):
@@ -380,7 +380,7 @@ class MokioMindModel(nn.Module):
         return hidden_states, presents
     
 
-class MokioMindForCausalLM(PretrainedConfig,GenerationMixin):
+class MokioMindForCausalLM(PreTrainedModel,GenerationMixin):
     config_class = MokioMindConfig
 
     def __init__(self, config:MokioMindConfig):
